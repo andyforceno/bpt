@@ -1,0 +1,282 @@
+#! /bin/bash
+
+################################
+# bpt: Bash Package Tracker
+# version 1.0 (build 230815)
+# 
+# By Andy Forceno
+# <t4exanadu@gmail.com>
+#
+################################
+
+# TODO: Test update-checking code and then RELEASE
+
+#
+# Boxoh does not list tracking info for USPS first class mail (tracking numbers beginning with 9*)
+# I have contacted them about this and have received no reply
+# Until I develop a work-around, I have no solution
+#
+
+args=( "$@" )
+ver="v1.0 (build 230815)"
+api_key="10yc43zdwz1-1"
+
+if [[ ! -f ~/.bptrc ]];
+then
+	touch ~/.bptrc
+
+echo -e "# Default location to look for tracking numbers file if none is specified during execution
+file=tracking.list\n
+# Default interval (s,m, h) used to check for updates while in daemon mode (-d)
+interval=6h\n
+# If "\"yes"\", delivered packages will be automatically removed from tracking.list
+autoremove=no\n
+# Set to "\"yes"\" to enable sending of push notifications to your phone when bpt is in daemon mode
+# Requires the Pushbullet client SHuttle: https://github.com/andyforceno/shuttle
+# Default is to output updates to terminal only
+push_notify=no\n
+# The device to which you want push notifications sent. Obtained via the SHuttle command "\"shuttle devices"\"
+push_device=Galaxy_S4\n" >> ~/.bptrc
+fi
+
+# Verify that we are connected to the web and that Boxoh is reachable
+
+source ~/.bptrc
+
+track_package () {
+# Check internet connection
+ping -c 1 -d 8.8.8.8 > /dev/null
+rc=$?
+if [[ $rc -ne 0 ]]; then                  
+echo -e "The internet is unreachable. Check your network connection.\n"
+exit 1
+fi
+
+# Main API call to obtain tracking information for <tracking number(s)>
+rss=$(curl -s http://api.boxoh.com/v2/rest/key/$api_key/track/$tracking/rss/ -H "Accept: application/xml" -X GET)
+
+# Check if tracking information is unavailable
+# Condition after operands is to supress errors when using the -d flag (may be removed in the future)
+	rss_false=$(echo $rss | grep -o "\"rss\"\:false")
+	if [ -n "$rss_false" ] && [[ ! $1 =~ "-d.*" ]];
+		then
+			echo -e "\nError: Tracking information for $tracking is currently unavailable. Please try again later."
+	fi
+
+# Nicely format tracking info by stripping out all HTML code & charcacter codes, and other cosmetic improvements 
+	packages=$(echo -e "$rss" | sed -e 's|\\/|/|g' | grep -iPo '(?<=<description>)(.*)(?=<\/description>)'  \
+			 | sed -e 's/&lt;br\/&gt;&lt;b&gt;/ /g' -e 's/&lt;\/b&gt;&lt;br\/&gt;/ - /g' -re 's#\bam\b|\bpm\b#\U&#g' -e 's/ - $//')
+
+# This gets called for -a|all flag
+	packages="${packages//"\/"//}"
+# This gets called for -d|daemon and -u|update flags
+	last_update=$(echo -e "$packages" | sed -n 2p | cut -d\  -f4-)
+}
+
+parse_file () {
+# Check for duplicate entries and remove them
+awk '!seen[$0]++' "$file" > "$file.temp"
+mv "$file.temp" "$file"
+
+# Main loop
+tracking_nums=( $(cat $file) )
+for i in $(seq 0 $((${#tracking_nums[@]}-1)));
+ do
+    tracking="${tracking_nums[$i]}"
+    track_package
+  if [[ ${args[0]} = "-a" ]];
+  		then
+ 		   echo -e "\n$packages"
+ # Don't prefix tracking info with tracking numbers when information is unavailable
+ 	elif [[ ${args[0]} = "-u" ]] && [ -z "$rss_false" ];
+ 		then
+ 			echo -e "\n${tracking_nums[$i]}:\n$last_update"   
+ 	fi
+check_delivered
+done 
+}
+
+check_delivered () {
+# If packaged reached is delivered and autoremove="yes", then clean up tracking.list
+if [[ $autoremove = "yes" ]] && [[ $last_update =~ Delivered ]];
+	then 
+		sed -i "/$tracking/d" $file 
+		echo -e "Tracking number $tracking removed from $file"
+fi
+}
+
+# set_alias () {
+# 
+# #        http://api.boxoh.com/v2/rest/key/{apiKey}/get_alias/{num}/
+# # i think you can save package #s as aliases using a get req for this
+# alias=$(curl -s http://api.boxoh.com/v2/rest/key/$api_key/get_alias/$tracking/ -X GET)
+# echo -e "$alias"
+# }
+
+# TODO: Time checks, but I'm not sure date is being converted to UTS
+daemon () {
+# Get date and time of last update
+	date_last=$(echo -e "$last_update" | awk '{ print $1, $2 }')
+	tsec_last=$(date -d "$date_last" +"%s")
+
+	echo "Daemonized: Checking for updates in $interval intervals"
+while true
+	do
+		date_current=$(echo -e "$last_update" | awk '{ print $1, $2 }')
+		tsec_current=$(date -d "$date_current" +"%s")
+		tsec_diff=$(($tsec_current - $tsec_last))
+# When tsec_diff > 0, there is an update
+# So, SHuttle is executed and update info is output to terminal and <push_device>
+	if [[ "$tsec_diff" != 0 ]];
+	then
+		uxts_last=$uxts_current
+		echo -e "$(date +%H:%M): Tracking update:\n${tracking_nums[$i]}:\n$last_update"
+# Check if user wants push notifications
+		if [[ "$push_notify" = "yes" ]];
+			then
+				shuttle -p -n $push_device "Tracking update" "$last_update"
+		fi
+	else
+		echo -e "$(date +%H:%M): No updates available"
+	fi
+		sleep "$interval"
+		track_package
+done	
+}
+
+usage () {
+	echo "bpt - Bash Package Tracker - $ver"
+	echo  "Usage: bpt [OPTIONS] <tracking number> [EXTENDED] <file>
+
+OPTIONS:
+	-a | all		List all tracking updates for <number> or <file>	 
+	-c | clean		Remove delivered packages from <file> 
+	-d=<interval>		Run bpt as a daemon with <interval> to check for updates
+				interval = x(s|m|h), seconds (s), minutes (m), hours (h)
+				(If blank, default from ~/.bptrc is used)
+
+        -l | -u | last		List most recent tracking update for <number> or <file>
+         add 			Add <tracking number> to <file>
+         del 			Remove <tracking number> from <file>
+     	 list 			List all <tracking number> saved in <file>
+
+EXTENDED:				
+	-f			File to parse for tracking numbers 
+				(If blank, default from ~/.bptrc is used)
+
+Notes:
+"\"-d"\" is equivalent to "\"-u"\" running in a loop of <interval>
+Default <file> is $file 
+See ~/.bptrc for other program defaults
+
+Examples:
+./bpt add <tracking number>
+./bpt -a <tracking number>
+./bpt -a -f tracking.list
+./bpt -u <tracking number>
+./bpt -d=2h -f
+./bpt clean tracking.list
+./bpt list tracking.list
+"
+}
+
+# TODO: Handle cases in which there is no tracking# in stdin, look for it in file via parse_file
+case $1 in 
+		add)
+			check_dupe=$(grep "$2" $file)
+			if [ -n "$check_dupe" ];
+				then
+					echo -e "Duplicate tracking number. Not added $file\n"
+				else
+					echo -e "$2" >> $file
+					echo -e "Tracking number added to $file"
+					exit 0
+				fi
+			;;
+		del) 
+			check_exist=$(cat tracking.list | grep -wo "$2")
+			if [ -z "$check_exist" ];
+				then
+					echo -e "Tracking number not found in $file\n"
+				else
+					sed -i "/$2/d" $file 
+					echo -e "Tracking number "$2" removed from $file\n"
+			fi
+			;;	
+		-a | all)
+			if [[ "$BASH_ARGV" =~ [0-9] ]];
+				then
+					tracking="$2"
+					track_package
+					echo -e "$packages" 
+			elif [[ "$2" = "-f" ]];
+				then
+					:
+			fi
+			;;
+		-c | clean)
+# Allow cleaning of <file>
+			if [ -n "$2" ];
+				then
+					file=$2
+			fi
+			check_delivered
+			;;
+		-d*)
+			interval=$(echo "$1" | awk -F= '{ print $2 }')
+			if [[ "$BASH_ARGV" =~ [0-9] ]];
+			then
+				tracking="$BASH_ARGV"
+				track_package
+				daemon
+			fi
+			;;
+		list)
+# Check for user-specified <file> or use default
+			if [ -n "$2" ];
+				then
+					file=$2
+			fi
+			echo -e "Tracking numbers in $file:"
+			cat $file
+			exit 0
+			;;&
+		-l | -u | last | update)
+			if [[ "$BASH_ARGV" =~ [0-9] ]];
+				then
+					tracking="$BASH_ARGV"
+					track_package
+					echo -e "$last_update"
+			fi
+			;;
+		*)
+			usage
+			;;
+	esac
+
+case $2 in
+	-f | file)
+# Determie if tracking number is in cli args or file
+		if [ -z "$3" ];
+			then
+				file="tracking.list"
+			else
+				file="$3"
+		fi
+# Required so that all other cli flags are parsed before entering daemon loop
+	#	if [[ "$1" =~ -d.* ]] && [[ "$BASH_ARGV" =~ [0-9] ]];
+	#		then
+	#			interval=$(echo "$1" | awk -F= '{ print $2 }')
+	#			tracking="$BASH_ARGV"
+	#			track_package
+	#			daemon
+		if [[ "$1" =~ -d.* ]] && [[ "$2" =~ -f ]];
+			then
+				interval=$(echo "$1" | awk -F= '{ print $2 }')
+				parse_file
+				daemon
+			else
+				parse_file
+		fi
+		;;
+esac
